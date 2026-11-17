@@ -15,8 +15,8 @@ previous_dates = set()
 
 
 def display_dialog(center_to_data: dict[str, list[dict]]):
-    plain_message = "\n".join(
-        center + ": " + ", ".join(sorted({slot.get("from", "")[:10] for slot in data}))
+    plain_message = "\n\n".join(
+        center + ":\n" + "\n".join(f"  {line}" for line in format_slots(data))
         for center, data in center_to_data.items()
     )
     # Remote notification (Telegram + email); fall back to a local dialog if nothing was sent
@@ -24,7 +24,7 @@ def display_dialog(center_to_data: dict[str, list[dict]]):
         return
 
     center_messages = [
-        center + " " + ", ".join({slot.get("from", "")[:10] for slot in data}) + "\\n"
+        center + " " + "; ".join(format_slots(data)) + "\\n"
         for center, data in center_to_data.items()
     ]
     message = "\\n".join(center_messages)
@@ -144,7 +144,7 @@ if __name__ == "__main__":
                 if data := response.json():
                     centers_available[center] = data
                     new_dates = new_dates.union(
-                        {center + " " + slot.get("from", "")[:10] for slot in data}
+                        {center + " " + slot_key(slot) for slot in data}
                     )
 
             all_dates_seen = all_dates_seen.union(new_dates)

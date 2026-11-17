@@ -71,3 +71,36 @@ response_example = [
         "isPublic": True,
     },
 ]
+
+
+DAY_NAMES_NL = ["ma", "di", "wo", "do", "vr", "za", "zo"]
+
+
+def slot_key(slot: dict) -> str:
+    """Unique key for a slot: its start as 'YYYY-MM-DDTHH:MM'."""
+    return slot.get("from", "")[:16]
+
+
+def format_slots(slots: list[dict]) -> list[str]:
+    """
+    Group slots per day with their times, e.g.
+    ['vr 30/08/2024: 09:20-10:15, 10:15-11:10']
+    """
+    per_day: dict[str, list[str]] = {}
+    for slot in sorted(slots, key=lambda s: s.get("from", "")):
+        start = slot.get("from", "")
+        if len(start) < 16:
+            continue
+        end = slot.get("till", "")
+        time_str = start[11:16] + (f"-{end[11:16]}" if len(end) >= 16 else "")
+        per_day.setdefault(start[:10], []).append(time_str)
+
+    lines = []
+    for day, times in per_day.items():
+        try:
+            d = datetime.strptime(day, "%Y-%m-%d")
+            label = f"{DAY_NAMES_NL[d.weekday()]} {d.strftime('%d/%m/%Y')}"
+        except ValueError:
+            label = day
+        lines.append(f"{label}: {', '.join(times)}")
+    return lines

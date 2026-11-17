@@ -127,8 +127,8 @@ def run_checks():
                 if response.status_code == 200:
                     if data := response.json():
                         center_dates = {
-                            # Use YYYY-MM-DD format consistently
-                            center_name + " " + slot.get("from", "")[:10]
+                            # Key per slot: "<center> YYYY-MM-DDTHH:MM" so new times on a known day count too
+                            center_name + " " + slot_key(slot)
                             for slot in data
                             if slot.get("from")  # Ensure 'from' exists
                         }
@@ -183,25 +183,16 @@ def run_checks():
                 # Sort centers by name for consistent output
                 for center in sorted(centers_with_new_data.keys()):
                     data = centers_with_new_data[center]
-                    # Extract unique dates found *in this run* for this center
-                    dates_in_run = sorted(
-                        list(
-                            {
-                                slot.get("from", "")[:10]
-                                for slot in data
-                                if slot.get("from")
-                            }
-                        )
-                    )
-                    # Filter to show only dates that are actually new since the last check
-                    new_dates_output = [
-                        d
-                        for d in dates_in_run
-                        if f"{center} {d}" in newly_found_dates_since_last
+                    # Only the slots that are new since the last check, grouped per day with times
+                    new_slots = [
+                        slot
+                        for slot in data
+                        if f"{center} {slot_key(slot)}" in newly_found_dates_since_last
                     ]
+                    day_lines = format_slots(new_slots)
 
-                    if new_dates_output:
-                        msg = f"  {center}: {', '.join(new_dates_output)}"
+                    if day_lines:
+                        msg = f"{center}:\n" + "\n".join(f"  {line}" for line in day_lines)
                         center_messages.append(msg)
                         log_message(msg)  # Log each center individually
 
