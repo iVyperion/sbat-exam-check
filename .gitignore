@@ -7,3 +7,4 @@ dist
 __pycache__/
 .env
 seen_slots.json
+login_qr.png

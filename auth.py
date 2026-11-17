@@ -12,12 +12,25 @@ requiring the user to confirm on their phone again.
 
 import base64
 import json
+import os
 import queue
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 from constants import SBAT_LOGIN_URL, AVAILABLE_URL
+import notifier  # noqa: F401  (importing it loads .env before reading settings below)
+
+
+def _env_flag(name):
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# SBAT_HEADLESS=1 runs the browser invisibly (e.g. on a machine you can't see);
+# the login QR code is then relayed to you via Telegram (see notifier.QrRelay).
+HEADLESS = _env_flag("SBAT_HEADLESS")
+# How long to wait for an itsme login (seconds). Scanning a relayed QR takes longer.
+LOGIN_TIMEOUT = int(os.getenv("SBAT_LOGIN_TIMEOUT", "300"))
 
 
 def _decode_jwt_exp(token):
@@ -98,6 +111,7 @@ class AuthSession:
         self.token = None
         self.token_expiry = None  # UTC datetime
         self.last_refresh_was_reauth = False  # True when fallback re-auth was used
+        self._qr_relay = None
         self._refresh_lock = threading.Lock()
 
     def _log(self, msg):
@@ -144,7 +158,8 @@ class AuthSession:
             result = {"token": None}
             done = threading.Event()
             self._command_queue.put(("refresh", result, done))
-            done.wait(timeout=200)  # silent (~7s fast-fail) + re-auth (120s) + buffer
+            # silent (~70s worst case) + re-auth (LOGIN_TIMEOUT) + buffer
+            done.wait(timeout=LOGIN_TIMEOUT + 120)
             return result["token"]
 
     def needs_refresh(self, margin_seconds=300):
@@ -185,18 +200,34 @@ class AuthSession:
             initial_done.set()
             return
 
+        self._qr_relay = notifier.QrRelay(log=self._log)
+
         with sync_playwright() as p:
             # Try system Chrome first, fall back to Playwright's bundled Chromium
             try:
-                browser = p.chromium.launch(headless=False, channel="chrome")
+                browser = p.chromium.launch(headless=HEADLESS, channel="chrome")
             except Exception:
-                browser = p.chromium.launch(headless=False)
+                browser = p.chromium.launch(headless=HEADLESS)
 
-            context = browser.new_context()
+            if HEADLESS:
+                self._log("Running browser headless (SBAT_HEADLESS=1). "
+                          "The login QR code will be sent to Telegram.")
+                # Hide "HeadlessChrome" from the user agent and render sharply
+                # so the relayed QR code is easy to scan.
+                probe = browser.new_page()
+                ua = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
+                probe.close()
+                context = browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 1280, "height": 900},
+                    device_scale_factor=3,
+                )
+            else:
+                context = browser.new_context()
             page = context.new_page()
 
             # --- Initial authentication ---
-            token = self._wait_for_token(page, timeout=120)
+            token = self._wait_for_token(page, timeout=LOGIN_TIMEOUT)
             initial_result["token"] = token
             if token:
                 self.token = token
@@ -241,7 +272,7 @@ class AuthSession:
                         )
                         self._emit_event("REAUTH_NEEDED")
                         self._set_window_state(context, page, "normal")
-                        new_token = self._wait_for_token(page, timeout=120)
+                        new_token = self._wait_for_token(page, timeout=LOGIN_TIMEOUT)
                         if new_token:
                             self.token = new_token
                             self.token_expiry = _token_expiry(new_token)
@@ -254,6 +285,20 @@ class AuthSession:
                     done.set()
 
             browser.close()
+
+    def _relay_qr(self, page):
+        """If the itsme QR page is showing, send the current QR code to the user."""
+        try:
+            if "itsme" not in page.url:
+                return
+            qr = page.locator("div.qr-container").first
+            if qr.count() and qr.is_visible():
+                png = qr.screenshot(timeout=3000)
+            else:
+                png = page.screenshot(timeout=3000)  # Layout changed: send the whole page
+            self._qr_relay.update(png)
+        except Exception as e:
+            self._log(f"[diag] QR relay failed: {e}")
 
     def _wait_for_token(self, page, timeout, skip_token=None):
         """
@@ -316,15 +361,28 @@ class AuthSession:
                 self._log("Opening browser for itsme authentication...")
                 self._log("Please confirm your identity in the itsme app on your phone.")
                 page.goto(SBAT_LOGIN_URL)
+                # Accept the privacy checkbox and click the itsme button for the
+                # user, so the QR code appears without anyone touching the browser.
+                try:
+                    page.click('label:has-text("privacybeleid")', timeout=10000)
+                    page.click('div.btn', timeout=5000)
+                except Exception as e:
+                    self._log(f"[diag] Could not auto-click itsme login (click it manually): {e}")
 
             start = time.time()
+            last_qr_check = 0
             while not captured["token"] and time.time() - start < timeout:
                 try:
                     page.wait_for_timeout(500)
                 except Exception:
                     break
+                if not skip_token and time.time() - last_qr_check >= 2:
+                    last_qr_check = time.time()
+                    self._relay_qr(page)
         finally:
             page.remove_listener("request", on_request)
+            if not skip_token and self._qr_relay:
+                self._qr_relay.finish(success=bool(captured["token"]))
 
         if not captured["token"]:
             self._log(f"Authentication timed out after {timeout}s.")
