@@ -2,3 +2,4 @@ requests
 pytz
 playwright
 pyside6
+python-dotenv

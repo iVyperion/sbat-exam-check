@@ -36,6 +36,8 @@ a = Analysis(
         'queue',
         'pytz',
         'requests',
+        'dotenv',
+        'notifier',
     ],
     hookspath=[],
     hooksconfig={},

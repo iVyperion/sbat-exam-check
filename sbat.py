@@ -8,12 +8,21 @@ import platform
 
 from constants import *
 from auth import get_token, AuthSession
+from notifier import notify
 
 all_dates_seen = set()
 previous_dates = set()
 
 
 def display_dialog(center_to_data: dict[str, list[dict]]):
+    plain_message = "\n".join(
+        center + ": " + ", ".join(sorted({slot.get("from", "")[:10] for slot in data}))
+        for center, data in center_to_data.items()
+    )
+    # Remote notification (Telegram + email); fall back to a local dialog if nothing was sent
+    if notify("SBAT: new exam dates available", plain_message):
+        return
+
     center_messages = [
         center + " " + ", ".join({slot.get("from", "")[:10] for slot in data}) + "\\n"
         for center, data in center_to_data.items()
@@ -38,6 +47,8 @@ def display_dialog(center_to_data: dict[str, list[dict]]):
 def display_error(response):
     """Display an error dialog box, cross-platform."""
     error_message = response.text
+    if notify("SBAT: exam crawl failure", f"HTTP {response.status_code}\n{error_message[:1000]}"):
+        return
     if platform.system() == "Darwin":  # macOS
         script = """
         on run argv
@@ -122,6 +133,7 @@ if __name__ == "__main__":
                         response = requests.post(AVAILABLE_URL, headers=headers, json=PAYLOAD_BASE)
                     else:
                         print("Authentication failed. Exiting.")
+                        notify("SBAT: checker stopped", "Authentication failed — the checker has stopped. Please restart and log in via itsme.")
                         sys.exit(1)
 
                 if response.status_code != 200:

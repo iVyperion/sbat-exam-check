@@ -6,6 +6,7 @@ import threading
 import queue  # For thread-safe communication
 from constants import *
 from auth import AuthSession, test_token
+from notifier import notify
 from datetime import timezone
 
 # --- PySide6 Imports ---
@@ -209,7 +210,9 @@ def run_checks():
                 if center_messages:
                     # Send message to GUI thread to show the dialog
                     dialog_message = "\n".join(center_messages)
-                    gui_queue.put(("SHOW_INFO", dialog_message))
+                    # Telegram + email; only fall back to a local dialog if nothing was sent
+                    if not notify("SBAT: new exam dates available", dialog_message, log=log_message):
+                        gui_queue.put(("SHOW_INFO", dialog_message))
                 else:
                     # This case might happen if data structure changes or filtering is too strict
                     log_message(
@@ -396,6 +399,13 @@ class SbatCheckerWindow(QMainWindow):
 
     def _notify_reauth_needed(self):
         """Send an OS-level notification and bring the window to front."""
+        threading.Thread(
+            target=notify,
+            args=("SBAT: re-authentication needed",
+                  "Please confirm your identity in the itsme app so the checker can continue."),
+            kwargs={"log": log_message},
+            daemon=True,
+        ).start()
         import subprocess
         import platform
         system = platform.system()
@@ -519,6 +529,13 @@ class SbatCheckerWindow(QMainWindow):
 
                 elif message_data == "NEEDS_REAUTH":
                     self.append_log("Token expired. Please re-authenticate via itsme to continue.")
+                    threading.Thread(
+                        target=notify,
+                        args=("SBAT: checker stopped",
+                              "The token expired and the checker has stopped. Open the app and log in via itsme to continue."),
+                        kwargs={"log": log_message},
+                        daemon=True,
+                    ).start()
                     self.refresh_timer.stop()
                     self.set_stopped_state(token_expired=True)
                 elif message_data == "STOPPED_AUTH_FAILURE":
