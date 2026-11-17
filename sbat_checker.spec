@@ -38,6 +38,7 @@ a = Analysis(
         'requests',
         'dotenv',
         'notifier',
+        'seen_store',
     ],
     hookspath=[],
     hooksconfig={},

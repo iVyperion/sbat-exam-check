@@ -15,7 +15,7 @@ import json
 import queue
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from constants import SBAT_LOGIN_URL, AVAILABLE_URL
 
@@ -39,6 +39,13 @@ def _decode_jwt_exp(token):
     except Exception:
         pass
     return None
+
+
+def _token_expiry(token):
+    """JWT expiry, or a conservative 55-minute fallback if it can't be decoded."""
+    return _decode_jwt_exp(token) or (
+        datetime.now(timezone.utc) + timedelta(minutes=55)
+    )
 
 
 def _capture_token_from_request(request):
@@ -91,6 +98,7 @@ class AuthSession:
         self.token = None
         self.token_expiry = None  # UTC datetime
         self.last_refresh_was_reauth = False  # True when fallback re-auth was used
+        self._refresh_lock = threading.Lock()
 
     def _log(self, msg):
         if self._log_fn:
@@ -117,7 +125,7 @@ class AuthSession:
         done.wait()  # Wait for initial auth to complete
         return result["token"]
 
-    def refresh_token(self):
+    def refresh_token(self, stale_token=None):
         """
         Refresh the token. Attempts silent refresh first; if the itsme session
         has expired, automatically falls back to full re-auth (restores the
@@ -125,12 +133,26 @@ class AuthSession:
         phone). Sets last_refresh_was_reauth=True when the fallback was used.
         Blocks until a token is captured or both paths time out.
         Returns the new token string, or None on failure.
+
+        stale_token: the token the caller found to be expired. If another
+        thread already refreshed it in the meantime, the current token is
+        returned without starting a second refresh.
         """
-        result = {"token": None}
-        done = threading.Event()
-        self._command_queue.put(("refresh", result, done))
-        done.wait(timeout=200)  # silent (~7s fast-fail) + re-auth (120s) + buffer
-        return result["token"]
+        with self._refresh_lock:
+            if stale_token and self.token and self.token != stale_token:
+                return self.token
+            result = {"token": None}
+            done = threading.Event()
+            self._command_queue.put(("refresh", result, done))
+            done.wait(timeout=200)  # silent (~7s fast-fail) + re-auth (120s) + buffer
+            return result["token"]
+
+    def needs_refresh(self, margin_seconds=300):
+        """True if the token expires within `margin_seconds` (or already has)."""
+        if not self.token_expiry:
+            return False
+        remaining = (self.token_expiry - datetime.now(timezone.utc)).total_seconds()
+        return remaining <= margin_seconds
 
     def _set_window_state(self, context, page, state):
         """Set the browser window state via CDP. state: 'minimized' | 'normal'."""
@@ -178,7 +200,7 @@ class AuthSession:
             initial_result["token"] = token
             if token:
                 self.token = token
-                self.token_expiry = _decode_jwt_exp(token)
+                self.token_expiry = _token_expiry(token)
             initial_done.set()
 
             if not token:
@@ -207,7 +229,7 @@ class AuthSession:
                     )
                     if new_token:
                         self.token = new_token
-                        self.token_expiry = _decode_jwt_exp(new_token)
+                        self.token_expiry = _token_expiry(new_token)
                         self._log("Token refreshed silently.")
                     else:
                         # Silent refresh failed (itsme session expired).
@@ -222,7 +244,7 @@ class AuthSession:
                         new_token = self._wait_for_token(page, timeout=120)
                         if new_token:
                             self.token = new_token
-                            self.token_expiry = _decode_jwt_exp(new_token)
+                            self.token_expiry = _token_expiry(new_token)
                             self.last_refresh_was_reauth = True
                             self._log("Re-authenticated via itsme. Resuming.")
                             self._set_window_state(context, page, "minimized")

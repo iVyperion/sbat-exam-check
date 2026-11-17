@@ -7,6 +7,7 @@ import queue  # For thread-safe communication
 from constants import *
 from auth import AuthSession, test_token
 from notifier import notify
+from seen_store import load_seen, save_seen
 from datetime import timezone
 
 # --- PySide6 Imports ---
@@ -168,6 +169,20 @@ def run_checks():
             break  # Exit outer loop if stop is requested
 
         if auth_needed:
+            stale_token = headers["Authorization"][len("Bearer "):]
+            new_token = None
+            if auth_session:
+                log_message("Token rejected by SBAT. Refreshing token...")
+                new_token = auth_session.refresh_token(stale_token=stale_token)
+            if stop_event.is_set():
+                break
+            if new_token:
+                auth_token = new_token
+                gui_queue.put(
+                    "REAUTH_COMPLETED" if auth_session.last_refresh_was_reauth else "TOKEN_REFRESHED"
+                )
+                log_message("Token refreshed. Retrying check...")
+                continue  # Retry the cycle right away with the new token
             log_message("Token expired. Please re-authenticate via itsme.")
             gui_queue.put("NEEDS_REAUTH")
             break
@@ -213,19 +228,19 @@ def run_checks():
                 # Update seen dates *after* processing
                 all_dates_seen.update(current_run_dates)
                 previous_dates = current_run_dates.copy()
+                save_seen(all_dates_seen)
 
-            elif not newly_found_dates_since_last and not request_failed_in_cycle:
+            else:
+                # Nothing new (or only slots we've already been notified about reappeared)
                 log_message(
                     f"No new dates detected. Total unique dates seen so far: {len(all_dates_seen)}"
                 )
-                # Still update previous_dates even if no new ones, in case some disappeared
                 previous_dates = current_run_dates.copy()
-                # Ensure all_dates_seen includes everything from this run too
                 all_dates_seen.update(current_run_dates)
-            else:
-                # This case covers request_failed_in_cycle = True
-                log_message("Check cycle completed with errors. Will retry.")
-                # Do not update previous_dates or all_dates_seen if errors occurred
+                save_seen(all_dates_seen)
+        else:
+            log_message("Check cycle completed with errors. Will retry.")
+            # Do not update previous_dates or all_dates_seen if errors occurred
 
         # --- Sleep before next cycle ---
         if not stop_event.is_set():
@@ -321,10 +336,14 @@ class SbatCheckerWindow(QMainWindow):
         self.queue_timer.timeout.connect(self.process_gui_queue_qt)
         self.queue_timer.start(100)  # Check queue every 100ms
 
-        # --- Token Refresh Timer (fires once, before token expiry) ---
+        # --- Token Refresh Watchdog ---
+        # Checks every 30s whether the token expires within 5 min. A repeating
+        # check (instead of one long single-shot timer) also works after the
+        # computer wakes from sleep.
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.setInterval(30_000)
         self.refresh_timer.timeout.connect(self._on_refresh_timer)
+        self._refresh_running = threading.Event()
 
         # Auto-start itsme authentication so the user doesn't need to click
         QTimer.singleShot(200, self.on_itsme_login)
@@ -361,31 +380,28 @@ class SbatCheckerWindow(QMainWindow):
             gui_queue.put("ITSME_AUTH_FAILURE")
 
     def _schedule_token_refresh(self):
-        """Schedule a silent token refresh 5 minutes before the token expires.
-
-        Token expiry is read from the JWT exp claim so timing is exact.
-        The itsme IDP session has a shorter idle timeout than the JWT TTL,
-        so silent refresh often falls back to full re-auth regardless of
-        how early we try. Refreshing at T-5min minimises how often the user
-        is interrupted while still leaving a small buffer before the token
-        actually expires.
-        """
+        """Log the token lifetime and make sure the refresh watchdog is running."""
         global auth_session
         if not auth_session or not auth_session.token_expiry:
             return
         now_utc = datetime.now(timezone.utc)
-        seconds_until_expiry = (auth_session.token_expiry - now_utc).total_seconds()
-        refresh_in = max(0, seconds_until_expiry - 300)  # 5 min before expiry
-        self.refresh_timer.start(int(refresh_in * 1000))
+        minutes_left = int((auth_session.token_expiry - now_utc).total_seconds() / 60)
         self.append_log(
-            f"Token valid for {int(seconds_until_expiry / 60)} min. "
-            f"Silent refresh scheduled in {int(refresh_in / 60)} min."
+            f"Token valid for {minutes_left} min. It will be refreshed automatically "
+            f"5 min before it expires."
         )
+        if not self.refresh_timer.isActive():
+            self.refresh_timer.start()
 
     @Slot()
     def _on_refresh_timer(self):
-        """Fired by the refresh timer — attempt silent token refresh."""
-        self.append_log("Refreshing token silently...")
+        """Watchdog tick — refresh the token if it is about to expire."""
+        if not auth_session or self._refresh_running.is_set():
+            return
+        if not auth_session.needs_refresh(margin_seconds=300):
+            return
+        self.append_log("Token expires soon. Refreshing silently...")
+        self._refresh_running.set()
         threading.Thread(target=self._do_silent_refresh, daemon=True).start()
 
     def _notify_reauth_needed(self):
@@ -435,8 +451,12 @@ class SbatCheckerWindow(QMainWindow):
         """
         global auth_token, auth_session
         if not auth_session:
+            self._refresh_running.clear()
             return
-        new_token = auth_session.refresh_token()
+        try:
+            new_token = auth_session.refresh_token(stale_token=auth_token)
+        finally:
+            self._refresh_running.clear()
         if new_token:
             auth_token = new_token
             if auth_session.last_refresh_was_reauth:
@@ -528,6 +548,7 @@ class SbatCheckerWindow(QMainWindow):
                         daemon=True,
                     ).start()
                     self.refresh_timer.stop()
+                    stop_event.set()
                     self.set_stopped_state(token_expired=True)
                 elif message_data == "STOPPED_AUTH_FAILURE":
                     self.append_log("Authentication failed. Please re-authenticate.")
@@ -560,8 +581,11 @@ class SbatCheckerWindow(QMainWindow):
             return
 
         stop_event.clear()
-        all_dates_seen = set()
-        previous_dates = set()
+        # Restore slots seen in earlier runs so a restart doesn't re-notify them
+        all_dates_seen = load_seen()
+        previous_dates = set(all_dates_seen)
+        if all_dates_seen:
+            self.append_log(f"Loaded {len(all_dates_seen)} previously seen slots from file.")
 
         self.itsme_button.setEnabled(False)
         self.token_entry.setEnabled(False)

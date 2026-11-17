@@ -9,9 +9,11 @@ import platform
 from constants import *
 from auth import get_token, AuthSession
 from notifier import notify
+from seen_store import load_seen, save_seen
 
-all_dates_seen = set()
-previous_dates = set()
+# Restore slots seen in earlier runs so a restart doesn't re-notify them
+all_dates_seen = load_seen()
+previous_dates = set(all_dates_seen)
 
 
 def display_dialog(center_to_data: dict[str, list[dict]]):
@@ -147,8 +149,10 @@ if __name__ == "__main__":
                         {center + " " + slot_key(slot) for slot in data}
                     )
 
+            already_seen = all_dates_seen
             all_dates_seen = all_dates_seen.union(new_dates)
-            if centers_available and not new_dates.issubset(previous_dates):
+            save_seen(all_dates_seen)
+            if centers_available and not new_dates.issubset(previous_dates | already_seen):
                 previous_dates = new_dates
                 print(check_timestamp, centers_available.items())
                 display_dialog(centers_available)
